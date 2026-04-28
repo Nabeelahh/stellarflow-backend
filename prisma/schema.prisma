@@ -155,8 +155,40 @@ model Relayer {
   apiKey        String   @unique
   isActive      Boolean  @default(true)
   allowedAssets String
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
+  email         String?  @unique
+  passwordHash String?
+  role         String?  @default("VIEWER")
+  lastLoginAt   DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  permissionChanges PermissionChange[]
+  sessions          UserSession[]
+}
+
+model UserSession {
+  id           Int       @id @default(autoincrement())
+  relayerId   Int
+  relayer     Relayer   @relation(fields: [relayerId], references: [id])
+  token       String    @unique
+  ipAddress   String
+  userAgent   String
+  createdAt   DateTime  @default(now())
+  expiresAt   DateTime
+  isActive    Boolean   @default(true)
+}
+
+model PermissionChange {
+  id          Int       @id @default(autoincrement())
+  relayerId  Int
+  relayer    Relayer   @relation(fields: [relayerId], references: [id])
+  changedBy  Int
+  targetId   Int?
+  field      String
+  oldValue   String?
+  newValue   String?
+  reason     String?
+  createdAt  DateTime  @default(now())
 }
 
 // Hourly Statistics for smoothing out price spikes
