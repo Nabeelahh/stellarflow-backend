@@ -1,34 +1,68 @@
 import winston from 'winston';
 
-import { HttpLogTransport }
-  from '../transports/httpLogTransport';
+const {
+  combine,
+  timestamp,
+  errors,
+  json,
+  colorize,
+  printf,
+} = winston.format;
 
-const transports = [
-  new winston.transports.Console(),
-];
-
-if (
-  process.env
-    .LOG_STREAM_ENABLED ===
-  'true'
-) {
-  transports.push(
-    new HttpLogTransport({
-      level: 'info',
-    }),
-  );
-}
+const consoleFormat = printf(
+  ({
+    level,
+    message,
+    timestamp,
+    stack,
+  }) => {
+    return `${timestamp} [${level}]: ${
+      stack || message
+    }`;
+  },
+);
 
 export const logger =
   winston.createLogger({
     level: 'info',
 
-    format:
-      winston.format.combine(
-        winston.format.timestamp(),
+    format: combine(
+      timestamp(),
+      errors({ stack: true }),
+      json(),
+    ),
 
-        winston.format.json(),
-      ),
+    defaultMeta: {
+      service: 'backend-api',
+    },
 
-    transports,
+    transports: [
+      // Error Logs
+      new winston.transports.File({
+        filename:
+          'logs/error.log',
+        level: 'error',
+      }),
+
+      // Combined Logs
+      new winston.transports.File({
+        filename:
+          'logs/combined.log',
+      }),
+    ],
   });
+
+if (
+  process.env.NODE_ENV !==
+  'production'
+) {
+  logger.add(
+    new winston.transports.Console({
+      format: combine(
+        colorize(),
+        timestamp(),
+        consoleFormat,
+      ),
+    }),
+  );
+}
