@@ -59,6 +59,25 @@ async function testMarketRates() {
   }
   console.log();
 
+  // Sanity check: ensure one faulty currency does not break all-pair processing
+  console.log("🛡️ Testing isolation for getAllRates failure handling...");
+  class FailingMarketRateService extends MarketRateService {
+    async getRate(currency: string) {
+      if (currency === "GHS") {
+        throw new Error("Simulated GHS failure");
+      }
+      return super.getRate(currency);
+    }
+  }
+
+  const failingService = new FailingMarketRateService();
+  const isolatedResults = await failingService.getAllRates();
+  console.log("Isolation Results:", isolatedResults);
+  const failedCount = isolatedResults.filter((result) => !result.success).length;
+  const successCount = isolatedResults.filter((result) => result.success).length;
+  console.log(`✅ Isolation outcome: ${successCount} successes, ${failedCount} failures`);
+  console.log();
+
   // Test cache status
   console.log("💾 Cache status:");
   const cacheStatus = service.getCacheStatus();
