@@ -3,6 +3,9 @@ import prisma from "../lib/prisma";
 
 const router = Router();
 
+// In-memory cache for status responses (TTL 3000ms)
+let statusCache: { data: any; timestamp: number } = { data: null, timestamp: 0 };
+
 /**
  * @swagger
  * /api/v1/status:
@@ -34,6 +37,11 @@ const router = Router();
  *                   format: date-time
  */
 router.get("/", async (req, res) => {
+  const now = Date.now();
+  if (statusCache.data && now - statusCache.timestamp < 3000) {
+    return res.json(statusCache.data);
+  }
+
   let dbOk = false;
   let lastSync: string | null = null;
 
@@ -52,12 +60,17 @@ router.get("/", async (req, res) => {
     dbOk = false;
   }
 
-  res.json({
+  const result = {
     status: dbOk ? "green" : "red",
     db: dbOk ? "ok" : "error",
     lastSync,
     timestamp: new Date().toISOString(),
-  });
+  };
+
+  // Update cache
+  statusCache = { data: result, timestamp: now };
+
+  return res.json(result);
 });
 
 export default router;
