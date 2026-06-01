@@ -13,6 +13,7 @@ from .checked_math import (
     validate_metric_value,
 )
 from .ema import RollingEMA, update_ema, ema_sequence, smoothing_factor, progressive_smoothing_factor
+from .window import SlidingWindowBuffer
 
 __all__ = [
     "BoundaryViolationError",
@@ -32,4 +33,5 @@ __all__ = [
     "ema_sequence",
     "smoothing_factor",
     "progressive_smoothing_factor",
+    "SlidingWindowBuffer",
 ]
