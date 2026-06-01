@@ -15,7 +15,11 @@ export const prisma = new Proxy({}, {
             if (!connectionString) {
                 throw new Error("DATABASE_URL must be defined");
             }
-            const pool = new pg.Pool({ connectionString });
+            const pool = new pg.Pool({
+                connectionString,
+                max: 20,
+                idleTimeoutMillis: 10000,
+            });
             const adapter = new PrismaPg(pool);
             globalForPrisma.prisma = new PrismaClient({ adapter });
         }

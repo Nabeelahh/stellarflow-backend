@@ -1,7 +1,13 @@
-import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
-import { createClient, RedisClientType } from 'redis';
-import { CHANNELS } from './constants/channels';
-import { PriceCacheService } from '../cache/price-cache.service';
+import {
+  Injectable,
+  Logger,
+  OnModuleInit,
+  OnModuleDestroy,
+} from "@nestjs/common";
+import { createClient, RedisClientType } from "redis";
+import { CHANNELS } from "./constants/channels";
+import { PriceCacheService } from "../cache/price-cache.service";
+import { unpack } from "../serialization/binaryPack";
 
 @Injectable()
 export class RedisSubscriberService implements OnModuleInit, OnModuleDestroy {
@@ -10,7 +16,7 @@ export class RedisSubscriberService implements OnModuleInit, OnModuleDestroy {
 
   constructor(private readonly priceCache: PriceCacheService) {
     this.subscriber = createClient({
-      url: process.env.REDIS_URL || 'redis://localhost:6379',
+      url: process.env.REDIS_URL || "redis://localhost:6379",
     });
   }
 
@@ -19,14 +25,16 @@ export class RedisSubscriberService implements OnModuleInit, OnModuleDestroy {
 
     await this.subscriber.subscribe(CHANNELS.PRICE_UPDATES, (message) => {
       try {
-        const data = JSON.parse(message);
+        const payload =
+          typeof message === "string" ? Buffer.from(message, "utf-8") : message;
+        const data = unpack(payload);
         this.handlePriceUpdate(data);
       } catch (err) {
-        this.logger.error('Invalid message received', err);
+        this.logger.error("Invalid message received", err);
       }
     });
 
-    this.logger.log('Redis Subscriber listening...');
+    this.logger.log("Redis Subscriber listening...");
   }
 
   private handlePriceUpdate(data: any) {

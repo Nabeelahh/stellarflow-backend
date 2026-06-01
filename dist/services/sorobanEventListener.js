@@ -1,8 +1,9 @@
-import { Keypair } from "@stellar/stellar-sdk";
 import prisma from "../lib/prisma";
 import { broadcastToSessions } from "../lib/socket";
 import stellarProvider from "../lib/stellarProvider";
 import dotenv from "dotenv";
+import { signer } from "../signer";
+import { logger } from "../utils/logger";
 dotenv.config();
 export class SorobanEventListener {
     server;
@@ -12,11 +13,7 @@ export class SorobanEventListener {
     lastProcessedLedger = 0;
     pollTimer = null;
     constructor(pollIntervalMs = 15000) {
-        const secret = process.env.ORACLE_SECRET_KEY || process.env.SOROBAN_ADMIN_SECRET;
-        if (!secret) {
-            throw new Error("ORACLE_SECRET_KEY or SOROBAN_ADMIN_SECRET not found in environment variables");
-        }
-        this.oraclePublicKey = Keypair.fromSecret(secret).publicKey();
+        this.oraclePublicKey = ""; // Initialized in start()
         this.pollIntervalMs = pollIntervalMs;
         // Use the shared StellarProvider so failover state is shared across all
         // services rather than each managing its own Horizon URL.
@@ -24,25 +21,26 @@ export class SorobanEventListener {
     }
     async start() {
         if (this.isRunning) {
-            console.warn("SorobanEventListener is already running");
+            logger.warn("[EventListener] SorobanEventListener is already running");
             return;
         }
         this.isRunning = true;
-        console.log(`[EventListener] Starting listener for account ${this.oraclePublicKey}`);
+        this.oraclePublicKey = await signer.getPublicKey();
+        logger.info(`[EventListener] Starting listener for account ${this.oraclePublicKey}`);
         // Initialize last processed ledger from the most recent on-chain record
         const lastRecord = await prisma.onChainPrice.findFirst({
             orderBy: { ledgerSeq: "desc" },
         });
         if (lastRecord) {
             this.lastProcessedLedger = lastRecord.ledgerSeq;
-            console.log(`[EventListener] Resuming from ledger ${this.lastProcessedLedger}`);
+            logger.info(`[EventListener] Resuming from ledger ${this.lastProcessedLedger}`);
         }
         // Initial poll
         await this.pollTransactions();
         // Start periodic polling
         this.pollTimer = setInterval(() => {
             this.pollTransactions().catch((err) => {
-                console.error("[EventListener] Poll error:", err);
+                logger.networkError("[EventListener] Poll error:", { err });
             });
         }, this.pollIntervalMs);
     }
@@ -52,7 +50,7 @@ export class SorobanEventListener {
             this.pollTimer = null;
         }
         this.isRunning = false;
-        console.log("[EventListener] Stopped");
+        logger.info("[EventListener] Stopped");
     }
     restart(newIntervalMs) {
         if (!this.isRunning)
@@ -65,10 +63,10 @@ export class SorobanEventListener {
         }
         this.pollTimer = setInterval(() => {
             this.pollTransactions().catch((err) => {
-                console.error("[EventListener] Poll error:", err);
+                logger.networkError("[EventListener] Poll error:", { err });
             });
         }, this.pollIntervalMs);
-        console.info(`[EventListener] Poll interval updated to ${this.pollIntervalMs}ms`);
+        logger.info(`[EventListener] Poll interval updated to ${this.pollIntervalMs}ms`);
     }
     async pollTransactions() {
         try {
@@ -111,7 +109,7 @@ export class SorobanEventListener {
             stellarProvider.reportFailure(error);
             // Account not found is expected for new accounts with no transactions
             if (error instanceof Error && error.message.includes("status code 404")) {
-                console.log("[EventListener] No transactions found for oracle account");
+                logger.networkInfo("[EventListener] No transactions found for oracle account");
                 return;
             }
             throw error;
@@ -146,7 +144,7 @@ export class SorobanEventListener {
                 const valueStr = atob(String(valueBase64));
                 const rate = parseFloat(valueStr);
                 if (isNaN(rate)) {
-                    console.warn(`[EventListener] Invalid rate value for ${currency}: ${valueStr}`);
+                    logger.warn(`[EventListener] Invalid rate value for ${currency}: ${valueStr}`, { isNetwork: true });
                     continue;
                 }
                 confirmedPrices.push({
@@ -160,7 +158,7 @@ export class SorobanEventListener {
             }
         }
         catch (error) {
-            console.error(`[EventListener] Error parsing operations for tx ${tx.hash}:`, error);
+            logger.networkError(`[EventListener] Error parsing operations for tx ${tx.hash}:`, { error });
         }
         return confirmedPrices;
     }
@@ -184,10 +182,10 @@ export class SorobanEventListener {
                         confirmedAt: price.confirmedAt,
                     },
                 });
-                console.log(`[EventListener] Saved confirmed price: ${price.currency} = ${price.rate} (tx: ${price.txHash.substring(0, 8)}...)`);
+                logger.networkInfo(`[EventListener] Saved confirmed price: ${price.currency} = ${price.rate} (tx: ${price.txHash.substring(0, 8)}...)`);
             }
             catch (error) {
-                console.error(`[EventListener] Error saving price for ${price.currency}:`, error);
+                logger.networkError(`[EventListener] Error saving price for ${price.currency}:`, { error });
             }
         }
     }
