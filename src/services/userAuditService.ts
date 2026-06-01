@@ -1,5 +1,6 @@
 import { prisma } from "../lib/prisma.js";
 import { generateKsuid } from "../utils/ksuid.js";
+import { nowUTC } from "../utils/timeUtils.js";
 
 export enum UserAuditEventType {
   USER_LOGIN_SUCCESS = "USER_LOGIN_SUCCESS",
@@ -28,7 +29,7 @@ export interface AuditContext {
 export async function logUserAccessEvent(ctx: AuditContext): Promise<void> {
   const {
     userId,
-    actorId,
+    _actorId,
     ipAddress,
     userAgent,
     resourceType,
@@ -55,7 +56,7 @@ export async function logUserAccessEvent(ctx: AuditContext): Promise<void> {
       newState: after ? JSON.stringify(after) : null,
       ipAddress: ipAddress || null,
       userAgent: userAgent || null,
-      occurredAt: new Date(),
+      occurredAt: nowUTC(),
     },
   });
 }
@@ -77,7 +78,7 @@ export async function logLoginSuccess(
     resourceType: "SESSION",
     resourceId: userId,
     action: UserAuditEventType.USER_LOGIN_SUCCESS,
-    after: { email: user?.email, role: user?.role, loginAt: new Date() },
+    after: { email: user?.email, role: user?.role, loginAt: nowUTC() },
   });
 }
 
@@ -97,7 +98,7 @@ export async function logLoginFailed(
       eventDetails: JSON.stringify({ reason, email }),
       ipAddress: ipAddress || null,
       userAgent: userAgent || null,
-      occurredAt: new Date(),
+      occurredAt: nowUTC(),
     },
   });
 }

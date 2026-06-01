@@ -343,9 +343,9 @@ model AuditLog {
   ipAddress             String?   @db.VarChar(45)    // IP address of the request
   userAgent             String?   @db.VarChar(500)   // User agent of the request
   
-  // Timestamps
-  occurredAt            DateTime  @db.Timestamp(3)   // When the event occurred
-  createdAt             DateTime  @default(now())
+  // Timestamps – TIMESTAMPTZ ensures UTC storage and retrieval
+  occurredAt            DateTime  @db.Timestamptz(3) // When the event occurred (UTC)
+  createdAt             DateTime  @default(now())    @db.Timestamptz(3) // When record was created (UTC)
   
   @@index([eventType, occurredAt])
   @@index([actionType, occurredAt])
