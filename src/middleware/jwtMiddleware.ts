@@ -8,6 +8,8 @@ declare global {
         userId: number;
         email: string;
         role: string;
+        group?: string;        // Added for future group isolation
+        permissions?: string[]; // Added for fine-grained control
       };
       sessionId?: number;
     }
@@ -50,10 +52,13 @@ export const jwtMiddleware = (
     return next();
   }
 
+  // Updated user object with role (already present) + optional fields
   (req as Request & { user: any }).user = {
     userId: payload.userId,
     email: payload.email,
-    role: payload.role,
+    role: payload.role || 'OBSERVER',           // Default to OBSERVER if missing
+    group: payload.group,
+    permissions: payload.permissions,
   };
 
   next();

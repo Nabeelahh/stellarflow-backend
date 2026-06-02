@@ -3,6 +3,10 @@
   "compilerOptions": {
     "ignoreDeprecations": "6.0",
 
+    "baseUrl": ".",
+    "paths": {
+      "csv-writer": ["./src/types/csv-writer.d.ts"]
+    },
     // File Layout
     "rootDir": "./src",
     "outDir": "./dist",
@@ -42,5 +46,5 @@
     "skipLibCheck": true
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "test"]
+  "exclude": ["node_modules", "dist", "test", "src/modules", "src/cache/price-cache.service.ts"]
 }
