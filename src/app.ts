@@ -15,6 +15,7 @@ import cacheMetricsRouter from "./cache/CacheMetrics";
 import { specs } from "./lib/swagger";
 
 import { adminMiddleware } from "./middleware/adminMiddleware";
+import { adminRateLimitMiddleware } from "./middleware/adminRateLimitMiddleware";
 
 import { apiKeyMiddleware } from "./middleware/apiKeyMiddleware";
 
@@ -25,7 +26,10 @@ import { maintenanceMiddleware } from "./middleware/maintenanceMiddleware";
 
 import { rateLimitMiddleware } from "./middleware/rateLimitMiddleware";
 
-import { tracingMiddleware, axiosTracingMiddleware } from "./middleware/tracingMiddleware";
+import {
+  tracingMiddleware,
+  axiosTracingMiddleware,
+} from "./middleware/tracingMiddleware";
 import { jwtMiddleware } from "./middleware/jwtMiddleware";
 import adminRouter from "./routes/admin";
 
@@ -147,8 +151,6 @@ app.get(
   }),
 );
 
-
-
 app.use("/api/v1/auth", authRouter);
 
 app.use("/api", rateLimitMiddleware);
@@ -164,10 +166,20 @@ app.use("/api/v1/price-updates", signatureVerificationMiddleware);
 
 app.use("/api/v1/price-updates", latencyValidationMiddleware);
 
-app.use("/api/admin", adminMiddleware, adminRouter);
+app.use("/api/admin", adminMiddleware, adminRateLimitMiddleware, adminRouter);
 
-app.use("/api/admin/system", adminMiddleware, systemControlRouter);
-app.use("/api/v1/system", adminMiddleware, systemFailoverRouter);
+app.use(
+  "/api/admin/system",
+  adminMiddleware,
+  adminRateLimitMiddleware,
+  systemControlRouter,
+);
+app.use(
+  "/api/v1/system",
+  adminMiddleware,
+  adminRateLimitMiddleware,
+  systemFailoverRouter,
+);
 app.use("/api/v1/market-rates", marketRatesRouter);
 
 app.use("/api/v1/history", historyRouter);
