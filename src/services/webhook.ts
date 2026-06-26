@@ -131,6 +131,72 @@ export class WebhookService {
     await this.postMessage(message);
   }
 
+  async sendPriorityAlert(alertDetails: {
+    currency: string;
+    rate: number;
+    zScore: number;
+    mean: number;
+    stdDev: number;
+    timestamp: Date;
+  }): Promise<void> {
+    if (!this.webhookUrl) {
+      return;
+    }
+
+    const message = this.formatPriorityAlert(alertDetails);
+    await this.postMessage(message);
+  }
+
+  private formatPriorityAlert(alertDetails: {
+    currency: string;
+    rate: number;
+    zScore: number;
+    mean: number;
+    stdDev: number;
+    timestamp: Date;
+  }): WebhookPayload {
+    const { currency, rate, zScore, mean, stdDev, timestamp } = alertDetails;
+
+    if (this.platform === "discord") {
+      return {
+        embeds: [
+          {
+            title: "⚠️ Price Anomaly Detected",
+            color: 0xffaa00,
+            fields: [
+              { name: "Currency", value: currency, inline: true },
+              { name: "Rate", value: rate.toString(), inline: true },
+              { name: "Z-Score", value: zScore.toFixed(2), inline: true },
+              { name: "Mean", value: mean.toString(), inline: true },
+              { name: "Std Dev", value: stdDev.toString(), inline: true },
+              { name: "Time", value: timestamp.toISOString(), inline: true },
+            ],
+          },
+        ],
+      };
+    }
+
+    return {
+      blocks: [
+        {
+          type: "header",
+          text: { type: "plain_text", text: "⚠️ Price Anomaly Detected" },
+        },
+        {
+          type: "section",
+          fields: [
+            { type: "mrkdwn", text: `*Currency:*\n${currency}` },
+            { type: "mrkdwn", text: `*Rate:*\n${rate}` },
+            { type: "mrkdwn", text: `*Z-Score:*\n${zScore.toFixed(2)}` },
+            { type: "mrkdwn", text: `*Mean:*\n${mean}` },
+            { type: "mrkdwn", text: `*Std Dev:*\n${stdDev}` },
+            { type: "mrkdwn", text: `*Time:*\n${timestamp.toISOString()}` },
+          ],
+        },
+      ],
+    };
+  }
+
   private async postMessage(message: WebhookPayload): Promise<void> {
     if (!this.webhookUrl) {
       return;

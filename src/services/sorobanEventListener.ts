@@ -135,7 +135,7 @@ export class SorobanEventListener {
             timestamp: Date.now()
           };
 
-          if (this.bpManager.enqueue(packet)) {
+          if (await this.bpManager.enqueue(packet)) {
             // Update tracking only if it was accepted by queue
             if (price.ledgerSeq > this.lastProcessedLedger) {
               this.lastProcessedLedger = price.ledgerSeq;
@@ -192,4 +192,14 @@ export class SorobanEventListener {
   }
 
   isActive(): boolean { return this.isRunning; }
+
+  restart(newPollIntervalMs?: number): void {
+    this.stop();
+    if (newPollIntervalMs) {
+      this.pollIntervalMs = newPollIntervalMs;
+    }
+    this.start().catch((err) => {
+      logger.error("[EventListener] Failed to restart:", err);
+    });
+  }
 }

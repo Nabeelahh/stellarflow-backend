@@ -250,7 +250,7 @@ export class SystemControlController {
       // Execute the action
       let executionResult: string;
       try {
-        executionResult = await this.executeAction(consensus.actionType, consensus.actionData);
+        executionResult = await this.executeAction(consensus.actionType, consensus.actionData ?? "");
       } catch (error) {
         executionResult = `Execution failed: ${error instanceof Error ? error.message : String(error)}`;
         

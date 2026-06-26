@@ -48,7 +48,7 @@ export class SignatureValidationService {
     const pendingConsensus = await prisma.pendingConsensus.create({
       data: {
         actionType: request.actionType,
-        actionData: request.actionData,
+        actionData: request.actionData ?? null,
         status: "PENDING",
         requiredSignatures,
         collectedSignatures: 0,
@@ -89,7 +89,7 @@ export class SignatureValidationService {
       return { valid: false, canExecute: false, message: "Consensus request has expired" };
     }
 
-    if (consensus.pendingSignatures.some(sig => sig.adminPublicKey === adminSignature.adminPublicKey)) {
+    if (consensus.pendingSignatures.some((sig: { adminPublicKey: string }) => sig.adminPublicKey === adminSignature.adminPublicKey)) {
       return { valid: false, canExecute: false, message: "Admin has already signed" };
     }
 
@@ -115,7 +115,7 @@ export class SignatureValidationService {
       return { valid: false, canExecute: false, message: "Invalid signature" };
     }
 
-    const updatedConsensus = await prisma.$transaction(async (tx) => {
+    const updatedConsensus = await prisma.$transaction(async (tx: any) => {
       await tx.pendingSignature.create({
         data: {
           pendingConsensusId: consensusId,

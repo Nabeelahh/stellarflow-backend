@@ -8,7 +8,7 @@ import {
   failedSubmissions,
   gasUsagePerAsset,
   submissionDuration,
-} from "../metrics";
+} from "../middleware/metrics";
 
 dotenv.config();
 
