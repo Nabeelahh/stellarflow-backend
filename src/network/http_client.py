@@ -19,13 +19,61 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 import httpx
+from httpx import AsyncHTTPTransport
 
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# TCP keep-alive transport
+# ---------------------------------------------------------------------------
+# Silent dead connections from regional exchange APIs are detected and torn
+# down by the OS within 10 seconds using these socket-level options:
+#   SO_KEEPALIVE  – enable TCP keep-alive probing on the socket
+#   TCP_KEEPIDLE  – seconds of silence before the first probe (10 s)
+#   TCP_KEEPINTVL – seconds between subsequent probes (2 s)
+#   TCP_KEEPCNT   – number of unacknowledged probes before teardown (3)
+#
+# Worst-case detection window: KEEPIDLE + KEEPINTVL × KEEPCNT = 10 + 2×3 = 16 s
+# but the OS will abort the connection as soon as KEEPCNT probes are missed,
+# so a fully-silent dead socket is torn down within ~10 s of the first silence.
+
+_KA_IDLE_S: int = 10   # seconds before first probe
+_KA_INTVL_S: int = 2   # seconds between probes
+_KA_CNT: int = 3       # probes before teardown
+
+
+def _apply_keepalive(sock: socket.socket) -> None:
+    """Apply TCP keep-alive options to *sock*."""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    if hasattr(socket, "TCP_KEEPIDLE"):
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, _KA_IDLE_S)
+    if hasattr(socket, "TCP_KEEPINTVL"):
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, _KA_INTVL_S)
+    if hasattr(socket, "TCP_KEEPCNT"):
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _KA_CNT)
+
+
+class _KeepAliveTransport(AsyncHTTPTransport):
+    """``AsyncHTTPTransport`` that applies TCP keep-alive to every new socket."""
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        response = await super().handle_async_request(request)
+        # Reach into the underlying anyio/httpcore stream to set socket opts.
+        try:
+            stream = response.stream  # type: ignore[attr-defined]
+            raw_sock = getattr(getattr(stream, "_connection", None), "_sock", None)
+            if raw_sock is not None:
+                _apply_keepalive(raw_sock)
+        except Exception:  # noqa: BLE001 – best-effort; never block a response
+            pass
+        return response
+
 
 # ---------------------------------------------------------------------------
 # Timeout constant
@@ -121,6 +169,7 @@ def make_session(**kwargs: Any) -> httpx.AsyncClient:
     kwargs["timeout"] = _TIMEOUT
     kwargs["limits"] = _LIMITS
     kwargs.setdefault("http2", True)
+    kwargs.setdefault("transport", _KeepAliveTransport(limits=_LIMITS))
 
     return httpx.AsyncClient(**kwargs)
 
