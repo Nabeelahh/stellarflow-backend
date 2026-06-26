@@ -131,6 +131,21 @@ export class WebhookService {
     await this.postMessage(message);
   }
 
+  async sendPriorityAlert(details: {
+    currency: string;
+    rate: number;
+    zScore: number;
+    mean: number;
+    stdDev: number;
+    timestamp: Date;
+  }): Promise<void> {
+    if (!this.webhookUrl) return;
+    const text = `🚨 *Price Anomaly* — ${details.currency}\nRate: ${details.rate} | Z-Score: ${details.zScore.toFixed(2)}σ | Mean: ${details.mean.toFixed(4)} | StdDev: ${details.stdDev.toFixed(4)}`;
+    await this.postMessage({
+      blocks: [{ type: "section", text: { type: "mrkdwn", text } }],
+    });
+  }
+
   private async postMessage(message: WebhookPayload): Promise<void> {
     if (!this.webhookUrl) {
       return;

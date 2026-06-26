@@ -1,6 +1,6 @@
 import { createLogger, format, transports } from "winston";
 import * as path from "path";
-import * as DailyRotateFile from "winston-daily-rotate-file";
+import DailyRotateFile from "winston-daily-rotate-file";
 
 const logDir = path.resolve(process.cwd(), "logs");
 
