@@ -215,7 +215,7 @@ class NonceTracker:
 
     def sync_nonce(self, address: str, nonce: int) -> None:
         """Overwrite the cached nonce with a known-good ledger value.
-
+        
         Call this after a tx_bad_seq error to realign the local counter with
         the chain's authoritative sequence number. This also clears all
         pending-slot bookkeeping for the account, since any in-flight nonces
@@ -228,6 +228,15 @@ class NonceTracker:
             self._nonces[address] = nonce
             self._pending.pop(address, None)
             logger.info("[NonceTracker] Synced nonce for %s → %d", address, nonce)
+
+    def get_nonce(self, address: str) -> Optional[int]:
+        """Return the current cached nonce for *address*, if it exists.
+        
+        Time: O(1).
+        """
+        lock = self._get_lock(address)
+        with lock:
+            return self._nonces.get(address)
 
     def invalidate(self, address: Optional[str] = None) -> None:
         """Evict the cached nonce for *address*, or all accounts when omitted.

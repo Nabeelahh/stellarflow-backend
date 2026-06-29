@@ -20,6 +20,7 @@ import logging
 import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, MutableMapping, Optional, Protocol
+from .nonce_tracker import nonce_tracker
 
 from network.nonce_tracker import NonceTracker, nonce_tracker
 
@@ -291,7 +292,6 @@ class TxManager:
 tx_manager = TxManager(tracker=nonce_tracker)
 
 __all__ = [
-    "AtomicIntegerCounter",
     "BroadcastResult",
     "TxManager",
     "tx_manager",
