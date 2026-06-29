@@ -1,10 +1,13 @@
+import asyncio
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+import aiohttp
+import requests
 
 # Default time a nonce may sit "pending" (issued, but neither confirmed nor
 # failed) before it is reported as stale. Tunable per call via
@@ -229,10 +232,39 @@ class NonceTracker:
             self._pending.pop(address, None)
             logger.info("[NonceTracker] Synced nonce for %s → %d", address, nonce)
 
-    def get_nonce(self, address: str) -> Optional[int]:
-        """Return the current cached nonce for *address*, if it exists.
+    async def _probe_node_health(self, session: aiohttp.ClientSession, node: HorizonNodeProfile) -> None:
+        """
+        Dispatches lightweight low-overhead endpoint probes to track real-time communication shifts.
+        """
+        # Horizon base path used for lightweight connection checks
+        probe_url = f"{node.url.rstrip('/')}/"
+        start_time = time.monotonic()
         
-        Time: O(1).
+        try:
+            async with asyncio.timeout(LIGHTWEIGHT_PING_TIMEOUT):
+                async with session.get(probe_url) as response:
+                    if response.status == 200:
+                        latency_ms = (time.monotonic() - start_time) * 1000
+                        node.record_metric(latency_ms)
+                        
+                        # Mark degraded if moving average indicates systematic latency decline
+                        if node.moving_average_latency > (LIGHTWEIGHT_PING_TIMEOUT * 1000):
+                            if node.is_healthy:
+                                logger.warning(f"Predictive Warning: Performance degradation detected on {node.name}. Latency: {node.moving_average_latency:.1f}ms")
+                            node.is_healthy = False
+                        else:
+                            node.is_healthy = True
+                        return
+
+                    node.is_healthy = False
+                    logger.debug(f"Node {node.name} returned non-200 footprint status: {response.status}")
+                    
+        except (asyncio.TimeoutError, aiohttp.ClientError):
+            node.is_healthy = False
+            node.record_metric(LIGHTWEIGHT_PING_TIMEOUT * 1000 * 2) # Penalize metric tracking log
+            logger.warn(f"Predictive Supervisor flagged node [{node.name}] as UNHEALTHY (Timeout/Network breakdown)")
+
+    def _evaluate_routing_topology(self) -> None:
         """
         lock = self._get_lock(address)
         with lock:
