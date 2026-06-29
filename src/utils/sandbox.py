@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Isolated Process Sandboxes for External Unverified Data Adapters
-===============================================================
 
 Executes untrusted third-party adapter scripts inside restricted subprocess
 containers so that a malicious or buggy endpoint cannot compromise core
