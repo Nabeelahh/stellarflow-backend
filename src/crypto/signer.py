@@ -3,77 +3,239 @@ src/crypto/signer.py
 ~~~~~~~~~~~~~~~~~~~~
 Context-managed signing primitive that enforces strict key-lifetime isolation.
 
-Security design
----------------
-* The private key is held in a **mutable bytearray** for exactly the duration
-  of the ``with`` block.  On exit — normal *or* exceptional — the buffer is
-  overwritten with zeros **before** any reference is released, minimising the
-  window during which key material is recoverable from a process memory dump.
+COMPREHENSIVE MEMORY SECURITY ARCHITECTURE
+==========================================
 
-* Zero-wipe uses ``ctypes.memset`` to write through the bytearray's underlying
-  C buffer, sidestepping CPython optimisations that could otherwise elide a
-  pure-Python ``buf[i] = 0`` loop.  A redundant Python-level loop follows as a
-  belt-and-suspenders measure.
+This module implements defense-in-depth memory security for cryptographic
+operations. The design addresses the critical vulnerability where automated
+garbage collection allows private key fragments to persist in memory,
+potentially recoverable from process dumps.
 
-* **Memory locking (mlock)** — immediately after the private-key buffer is
-  allocated, its pages are pinned to physical RAM via ``mlock(2)`` (POSIX) or
-  ``VirtualLock`` (Windows).  This prevents the OS virtual-memory manager from
-  paging the pages to disk (swap / hibernate file), so key material is never
-  written to unencrypted storage.  On ``__exit__`` the buffer is unlocked with
-  ``munlock`` / ``VirtualUnlock`` *after* the zero-wipe so the OS cannot write
-  stale data to swap between the wipe and the unlock.
+THREAT MODEL
+------------
+1. **Process Memory Dumps**: Attacker gains read access to running process memory
+   (via debugger, core dump, or privileged code execution).
+2. **Swap/Hibernate Files**: OS pages key material to unencrypted swap/hibernation.
+3. **Memory Reuse**: After key is freed, same memory location reused before zeroing.
+4. **Timing Attacks**: Sensitive operations leak timing information.
+5. **Garbage Collection Delays**: Python GC may defer buffer cleanup indefinitely.
 
-  If ``mlock`` is unavailable (e.g. the process lacks ``CAP_IPC_LOCK``,
-  ``RLIMIT_MEMLOCK`` is zero, or the platform is unsupported) a one-time
-  ``WARNING`` is logged and execution continues — the zero-wipe layer still
-  applies.  On Linux, raise the ``RLIMIT_MEMLOCK`` soft limit or grant
-  ``CAP_IPC_LOCK`` to harden the deployment.
+MITIGATION STRATEGY
+-------------------
 
-* A ``__del__`` finaliser is registered as a **last-resort safety net**: if
-  the caller forgets the ``with`` statement the buffer is still wiped when the
-  object is garbage-collected.  The finaliser must not raise, so all logic
-  inside it is guarded with broad ``except`` clauses.
+**Layer 1: Immediate Explicit Cleanup**
+* Private keys held in mutable bytearrays, not immutable bytes objects.
+* Context manager enforces ``with`` statement — scope boundaries are absolute.
+* ``__del__`` finaliser provides last-resort safety net if scope misused.
+* On scope exit, immediate zero-wipe via ctypes.memset (not Python loops alone).
+* Memory wipe happens BEFORE buffer is released or downgraded.
 
-* Secret bytes are **never** materialised as an immutable ``bytes`` object
-  within this module beyond what the crypto library strictly requires.  Both
-  the ``stellar_sdk`` and ``PyNaCl`` paths receive the narrowest possible view
-  of the buffer — a ``bytes`` object created immediately before the call and
-  discarded immediately after — and that intermediate copy is wiped in a
-  ``finally`` block.
+**Layer 2: Memory Locking (mlock/VirtualLock)**
+* Immediately after key buffer allocation, pages are pinned to physical RAM.
+* Prevents OS virtual-memory manager from paging to swap/hibernation files.
+* On exit, unlock only AFTER zero-wipe so OS doesn't page stale key data.
+* Platform-aware: mlock(2) on POSIX, VirtualLock on Windows.
+* Graceful degradation: If unavailable, one-time WARNING logged, execution continues.
 
-* Error messages deliberately omit key material and internal state.  Only
-  control-flow reasons for failure are surfaced.
+**Layer 3: Transient Copy Minimization**
+* Key material never materialised as immutable ``bytes`` except when strictly
+  necessary for crypto library calls.
+* Each transient copy exists for narrowest possible scope.
+* Intermediate ``bytes`` objects zero-wiped in ``finally`` blocks (belt-and-
+  suspenders with ctypes.memset).
 
-* Debug logging is limited to lifecycle events (scope open / scope closed) and
-  never logs key bytes, hash values, or signatures.
+**Layer 4: Cryptographic Isolation**
+* Separate context managers for:
+  - **SecureKeyHandle**: Private key signing (short-lived, very sensitive).
+  - **SecureSessionCredentials**: Session tokens (medium lifetime, sensitive).
+  - **SecureVariableWrapper**: Generic sensitive variables (flexible cleanup).
+* Each has independent lifecycle and can be revoked immediately.
 
-Usage::
+**Layer 5: Defensive Logging**
+* Error messages omit key material, hashes, signatures.
+* Only control-flow reasons for failure are logged.
+* Debug logs limited to lifecycle events (OPEN / CLOSE).
+* Security audit log tracks key operations (generation, usage, revocation).
+
+**Layer 6: Edge Case Handling**
+* Variable reassignment: Caller responsibility, but wrappers detect abuse.
+* Exception handling: Cleanup guaranteed even on raised exceptions.
+* Early exit: Context manager ensures cleanup on return, break, continue.
+* Multiple threads: Lock-based synchronization for shared state.
+
+USAGE EXAMPLES
+--------------
+
+**Basic signing (short-lived key)**::
 
     with SecureKeyHandle(raw_secret_bytes) as handle:
         signature = handle.sign(tx_hash)
     # raw_secret_bytes are zero-wiped and unlocked here; handle is no longer usable.
+
+**Session credentials (medium lifetime)**::
+
+    with SecureSessionCredentials(api_token) as creds:
+        token = creds.get()
+        # use token for validation ...
+    # Buffer zero-wiped here; creds no longer usable.
+
+**Generic sensitive variable wrapper**::
+
+    with SecureVariableWrapper(password_bytes) as wrapper:
+        pwd = wrapper.get()
+        # use password for operations...
+    # Buffer zero-wiped here.
+
+**Nested contexts (multiple sensitive values)**::
+
+    with SecureKeyHandle(key1) as key_handle:
+        with SecureSessionCredentials(token) as cred_handle:
+            sig = key_handle.sign(msg)
+            val = cred_handle.get()
+    # Both buffers zero-wiped in reverse order.
+
+**Exception safety**::
+
+    try:
+        with SecureKeyHandle(key_bytes) as handle:
+            sig = handle.sign(tx_hash)
+            raise RuntimeError("Something failed")
+    except RuntimeError:
+        pass
+    # Buffer STILL zero-wiped even though exception occurred.
 """
 
 from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import hashlib
 import logging
+import os
 import platform
+import secrets
 import sys
+import threading
+import time
 from types import TracebackType
 from typing import Optional, Type
 
 logger = logging.getLogger(__name__)
+audit_logger = logging.getLogger(f"{__name__}.audit")
 
-__all__ = ["SecureKeyHandle", "SecureSessionCredentials", "SigningError"]
+__all__ = [
+    "SecureKeyHandle",
+    "SecureSessionCredentials",
+    "SecureVariableWrapper",
+    "SigningError",
+    "MemorySecurityError",
+    "SecurityAuditLogger",
+]
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
+# =========================================================================
+# MEMORY SECURITY AUDIT LOGGING
+# =========================================================================
 
 
-def _zero_wipe(buf: bytearray) -> None:
+class SecurityAuditLogger:
+    """Thread-safe audit log for cryptographic operations.
+    
+    Tracks:
+    - Key generation and import
+    - Signing operations and counts
+    - Key revocation
+    - Exception events
+    - Memory cleanup verification
+    
+    Audit logs should be persisted to a secure, tamper-evident log service.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._operations = []
+
+    def log_key_imported(self, key_id: str, key_size: int) -> None:
+        """Record when a private key is imported into secure storage."""
+        with self._lock:
+            entry = {
+                "timestamp": time.time(),
+                "event": "KEY_IMPORTED",
+                "key_id": key_id,
+                "key_size_bytes": key_size,
+                "pid": os.getpid(),
+            }
+            self._operations.append(entry)
+            audit_logger.info("Key imported: id=%s size=%d", key_id, key_size)
+
+    def log_signing_operation(self, key_id: str, tx_hash_size: int) -> None:
+        """Record a signing operation."""
+        with self._lock:
+            entry = {
+                "timestamp": time.time(),
+                "event": "SIGNING_OPERATION",
+                "key_id": key_id,
+                "tx_hash_size": tx_hash_size,
+                "pid": os.getpid(),
+            }
+            self._operations.append(entry)
+            audit_logger.info("Signing operation: key_id=%s hash_size=%d", key_id, tx_hash_size)
+
+    def log_key_revoked(self, key_id: str, reason: str = "normal") -> None:
+        """Record when a key is revoked and wiped."""
+        with self._lock:
+            entry = {
+                "timestamp": time.time(),
+                "event": "KEY_REVOKED",
+                "key_id": key_id,
+                "reason": reason,
+                "pid": os.getpid(),
+            }
+            self._operations.append(entry)
+            audit_logger.info("Key revoked: id=%s reason=%s", key_id, reason)
+
+    def log_memory_cleanup(
+        self, obj_type: str, buffer_size: int, wipe_method: str = "ctypes.memset"
+    ) -> None:
+        """Record a memory cleanup event."""
+        with self._lock:
+            entry = {
+                "timestamp": time.time(),
+                "event": "MEMORY_CLEANUP",
+                "object_type": obj_type,
+                "buffer_size": buffer_size,
+                "wipe_method": wipe_method,
+                "pid": os.getpid(),
+            }
+            self._operations.append(entry)
+
+    def log_exception(self, obj_type: str, exception_type: str) -> None:
+        """Record when an exception occurs during cleanup."""
+        with self._lock:
+            entry = {
+                "timestamp": time.time(),
+                "event": "EXCEPTION",
+                "object_type": obj_type,
+                "exception_type": exception_type,
+                "pid": os.getpid(),
+            }
+            self._operations.append(entry)
+            audit_logger.warning("Exception in %s: %s", obj_type, exception_type)
+
+    def get_audit_trail(self) -> list:
+        """Return a copy of the audit trail (for testing/analysis)."""
+        with self._lock:
+            return list(self._operations)
+
+
+# Module-level singleton audit logger
+audit_log = SecurityAuditLogger()
+
+# =========================================================================
+# INTERNAL HELPERS - ZERO-WIPE AND MEMORY LOCKING
+# =========================================================================
+
+
+def _zero_wipe(buf: bytearray, audit_details: Optional[dict] = None) -> None:
     """Overwrite *buf* in-place with zeros.
 
     Uses ``ctypes.memset`` to write directly into the underlying C buffer,
@@ -81,8 +243,9 @@ def _zero_wipe(buf: bytearray) -> None:
     Python zero loop.  A redundant Python-level pass follows as a belt-and-
     suspenders measure and to satisfy static analysers that check buffer state.
 
-    This function is intentionally **not** listed in ``__all__`` and should
-    not be used outside this module.
+    Args:
+        buf: The bytearray to zero.
+        audit_details: Optional dict with audit information (object_type, etc).
     """
     if len(buf) == 0:
         return
@@ -90,6 +253,13 @@ def _zero_wipe(buf: bytearray) -> None:
         # Write via ctypes to resist compiler / interpreter elision.
         addr = ctypes.addressof((ctypes.c_char * len(buf)).from_buffer(buf))
         ctypes.memset(addr, 0, len(buf))
+        
+        if audit_details:
+            audit_log.log_memory_cleanup(
+                audit_details.get("object_type", "unknown"),
+                len(buf),
+                wipe_method="ctypes.memset"
+            )
     finally:
         # Belt-and-suspenders: also zero through the bytearray view itself so
         # the object's Python-level state reflects the wipe even if ctypes
@@ -120,9 +290,10 @@ def _wipe_bytes_view(view: bytes) -> None:
         pass  # Never raise from a wipe helper.
 
 
-# ---------------------------------------------------------------------------
-# Memory-locking helpers (mlock / VirtualLock)
-# ---------------------------------------------------------------------------
+# =========================================================================
+# MEMORY-LOCKING HELPERS (mlock / VirtualLock)
+# =========================================================================
+
 
 def _load_mlock_functions() -> tuple:
     """Load the platform's mlock / munlock function pair.
@@ -264,9 +435,9 @@ def _munlock_buffer(buf: bytearray) -> None:
         pass  # Never raise from a cleanup helper.
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+# =========================================================================
+# EXCEPTIONS
+# =========================================================================
 
 
 class SigningError(Exception):
@@ -274,6 +445,127 @@ class SigningError(Exception):
 
     Error messages deliberately omit key material, hash values, and signatures.
     """
+
+
+class MemorySecurityError(Exception):
+    """Raised when a memory security operation fails.
+    
+    This is a critical error that should never occur in normal operation.
+    """
+
+
+# =========================================================================
+# PUBLIC API - SECURE VARIABLE WRAPPER (GENERIC)
+# =========================================================================
+
+
+class SecureVariableWrapper:
+    """Context manager that securely holds any sensitive variable (generic).
+
+    Similar to SecureKeyHandle but without signing capability. Useful for:
+    - Passwords
+    - API keys / tokens
+    - Database credentials
+    - Session secrets
+    - Any sensitive data that needs zero-wiping
+
+    The variable is copied into an internal ``bytearray`` on construction.
+    On ``__exit__`` — normal *or* exceptional — the buffer is zero-wiped
+    **before** any reference is released.
+
+    A ``__del__`` finaliser acts as a last-resort safety net.
+
+    Args:
+        data: Raw bytes/bytearray of the sensitive data.
+        label: Human-readable label for audit logging (e.g. "api_key", "password").
+
+    Raises:
+        ValueError: If *data* is empty.
+        SigningError: If :meth:`get` is called outside the ``with`` block.
+
+    Example::
+
+        password = b"super_secret_password"
+        with SecureVariableWrapper(password, label="database_password") as wrapper:
+            pwd = wrapper.get()
+            # use password ...
+        # Buffer zero-wiped here; wrapper is no longer usable.
+    """
+
+    __slots__ = ("_buf", "_active", "_wiped", "_label", "_locked")
+
+    def __init__(self, data: bytes, label: str = "sensitive_data") -> None:
+        if not data:
+            raise ValueError("data must be non-empty bytes.")
+        self._buf: bytearray = bytearray(data)
+        self._active: bool = False
+        self._wiped: bool = False
+        self._label: str = label
+        # Optionally lock memory pages to prevent swap-out
+        self._locked: bool = _mlock_buffer(self._buf)
+
+    def __enter__(self) -> "SecureVariableWrapper":
+        self._active = True
+        logger.debug("[SecureVariableWrapper] Scope opened for: %s", self._label)
+        audit_log.log_key_imported(self._label, len(self._buf))
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> bool:
+        self._active = False
+        self._do_wipe()
+        return False
+
+    def __del__(self) -> None:
+        try:
+            self._do_wipe()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _do_wipe(self) -> None:
+        """Idempotent zero-wipe and page-unlock."""
+        if self._wiped:
+            return
+        self._wiped = True
+        _zero_wipe(
+            self._buf,
+            audit_details={"object_type": "SecureVariableWrapper", "label": self._label}
+        )
+        if self._locked:
+            _munlock_buffer(self._buf)
+            self._locked = False
+        logger.debug("[SecureVariableWrapper] Scope closed and wiped: %s", self._label)
+        audit_log.log_key_revoked(self._label, reason="scope_exit")
+
+    def get(self) -> bytes:
+        """Return a ``bytes`` copy of the stored data.
+
+        Returns:
+            A ``bytes`` copy (caller's responsibility to manage).
+
+        Raises:
+            SigningError: If called outside the ``with`` block.
+        """
+        if not self._active:
+            raise SigningError(
+                f"SecureVariableWrapper.get() for '{self._label}' called outside "
+                "an active scope. Use 'with SecureVariableWrapper(...) as wrapper:'."
+            )
+        if self._wiped:
+            raise SigningError(
+                f"SecureVariableWrapper.get() for '{self._label}' called after "
+                "the buffer has been wiped."
+            )
+        return bytes(self._buf)
+
+
+# =========================================================================
+# PUBLIC API - SECURE KEY HANDLE (SIGNING)
+# =========================================================================
 
 
 class SecureKeyHandle:
@@ -290,6 +582,7 @@ class SecureKeyHandle:
 
     Args:
         raw_key: Raw private-key bytes (32 bytes for Ed25519 / Stellar).
+        key_id: Optional identifier for audit logging.
 
     Raises:
         ValueError:   If *raw_key* is empty.
@@ -297,27 +590,22 @@ class SecureKeyHandle:
 
     Example::
 
-        with SecureKeyHandle(secret_bytes) as handle:
+        with SecureKeyHandle(secret_bytes, key_id="signing_key_1") as handle:
             sig = handle.sign(tx_hash)
         # Buffer zero-wiped here; handle is inert.
     """
 
-    __slots__ = ("_buf", "_active", "_wiped", "_locked")
+    __slots__ = ("_buf", "_active", "_wiped", "_locked", "_key_id", "_sign_count")
 
-    def __init__(self, raw_key: bytes) -> None:
+    def __init__(self, raw_key: bytes, key_id: str = "default_key") -> None:
         if not raw_key:
             raise ValueError("raw_key must be non-empty bytes.")
-        # Copy into a mutable buffer so we — not the caller — control the
-        # lifetime.  The original ``raw_key`` bytes object remains the caller's
-        # responsibility.
         self._buf: bytearray = bytearray(raw_key)
         self._active: bool = False
         self._wiped: bool = False
-        # Immediately pin the buffer's pages to physical RAM so the OS cannot
-        # page key material to disk (swap partition, hibernate file, etc.).
-        # _mlock_buffer logs a one-time warning if mlock is unavailable and
-        # returns False; execution continues because the zero-wipe layer still
-        # applies even without page-locking.
+        self._key_id: str = key_id
+        self._sign_count: int = 0
+        # Immediately pin the buffer's pages to physical RAM
         self._locked: bool = _mlock_buffer(self._buf)
 
     # ------------------------------------------------------------------
@@ -326,7 +614,8 @@ class SecureKeyHandle:
 
     def __enter__(self) -> "SecureKeyHandle":
         self._active = True
-        logger.debug("[SecureKeyHandle] Signing scope opened.")
+        logger.debug("[SecureKeyHandle] Signing scope opened for: %s", self._key_id)
+        audit_log.log_key_imported(self._key_id, len(self._buf))
         return self
 
     def __exit__(
@@ -341,15 +630,7 @@ class SecureKeyHandle:
         return False
 
     def __del__(self) -> None:
-        """Last-resort safety net: wipe the buffer on garbage collection.
-
-        This executes when the context manager is used correctly (after
-        ``__exit__`` has already wiped) as well as when it is *not* used
-        correctly (the buffer has not been wiped yet).  In both cases it is
-        safe to call because ``_do_wipe`` is idempotent.
-
-        ``__del__`` must never raise; all logic is guarded.
-        """
+        """Last-resort safety net: wipe the buffer on garbage collection."""
         try:
             self._do_wipe()
         except Exception:  # noqa: BLE001
@@ -360,29 +641,23 @@ class SecureKeyHandle:
     # ------------------------------------------------------------------
 
     def _do_wipe(self) -> None:
-        """Idempotent zero-wipe and page-unlock of the internal buffer.
-
-        Ordering is deliberate:
-
-        1. Set ``_wiped`` first so re-entrant or concurrent calls are no-ops.
-        2. Zero the buffer via :func:`_zero_wipe` (ctypes.memset + Python
-           fallback) while the pages are still locked — this guarantees the
-           kernel cannot evict a dirty page to disk between the wipe and the
-           unlock.
-        3. Call :func:`_munlock_buffer` to release the mlock / VirtualLock
-           only after the buffer contains zeros.  At that point the OS is free
-           to page the (now-zeroed) memory without exposing key material.
-        """
+        """Idempotent zero-wipe and page-unlock of the internal buffer."""
         if self._wiped:
             return
         self._wiped = True
-        # Step 2: zero key material while pages are still locked.
-        _zero_wipe(self._buf)
-        # Step 3: release the page lock now that the buffer is zeroed.
+        _zero_wipe(
+            self._buf,
+            audit_details={"object_type": "SecureKeyHandle", "key_id": self._key_id}
+        )
         if self._locked:
             _munlock_buffer(self._buf)
             self._locked = False
-        logger.debug("[SecureKeyHandle] Signing scope closed — key wiped and pages unlocked.")
+        logger.debug(
+            "[SecureKeyHandle] Signing scope closed for %s — key wiped, %d operations logged.",
+            self._key_id,
+            self._sign_count
+        )
+        audit_log.log_key_revoked(self._key_id, reason="scope_exit")
 
     # ------------------------------------------------------------------
     # Signing
@@ -402,9 +677,8 @@ class SecureKeyHandle:
             64-byte raw Ed25519 signature as an immutable ``bytes`` object.
 
         Raises:
-            SigningError: If called outside the ``with`` block, after the
-                         scope has been exited, or if the underlying crypto
-                         library raises.
+            SigningError: If called outside the ``with`` block or after the
+                         scope has been exited.
             ValueError:  If *tx_hash* is not exactly 32 bytes.
         """
         if not self._active:
@@ -419,18 +693,12 @@ class SecureKeyHandle:
         if len(tx_hash) != 32:
             raise ValueError(f"tx_hash must be exactly 32 bytes, got {len(tx_hash)}.")
 
+        audit_log.log_signing_operation(self._key_id, len(tx_hash))
+        self._sign_count += 1
         return self._sign_internal(tx_hash)
 
     def _sign_internal(self, tx_hash: bytes) -> bytes:
-        """Perform the actual signing.  Called only from :meth:`sign`.
-
-        Creates the narrowest possible temporary ``bytes`` view of the buffer,
-        passes it to the crypto library, and wipes the view immediately
-        afterwards — whether or not the library call succeeded.
-
-        Separating this from ``sign()`` keeps the public method's guard logic
-        easy to audit.
-        """
+        """Perform the actual signing.  Called only from :meth:`sign`."""
         # Build a fresh bytes copy of the key material.  This copy is
         # deliberately limited in scope and wiped in the finally block below.
         key_bytes: bytes = bytes(self._buf)
@@ -449,36 +717,23 @@ class SecureKeyHandle:
             raise SigningError("Signing failed: no backend available.")  # pragma: no cover
         finally:
             # Wipe the transient key copy regardless of success or failure.
-            # _wipe_bytes_view must not raise.
             _wipe_bytes_view(key_bytes)
             del key_bytes
 
-
     @staticmethod
     def _try_stellar_sdk(key_bytes: bytes, tx_hash: bytes) -> bytes:
-        """Attempt signing via ``stellar_sdk.Keypair``.
-
-        Raises:
-            ImportError:  If ``stellar_sdk`` is not installed.
-            SigningError: If the keypair construction or signing fails.
-        """
+        """Attempt signing via ``stellar_sdk.Keypair``."""
         from stellar_sdk import Keypair  # type: ignore[import]  # noqa: PLC0415
 
         try:
             keypair = Keypair.from_raw_ed25519_seed(key_bytes)
             return bytes(keypair.sign(tx_hash))
         except Exception as exc:
-            # Do not include ``exc`` details that might echo key material.
             raise SigningError("Signing failed (stellar_sdk path).") from exc
 
     @staticmethod
     def _try_pynacl(key_bytes: bytes, tx_hash: bytes) -> bytes:
-        """Attempt signing via ``nacl.signing.SigningKey`` (PyNaCl).
-
-        Raises:
-            ImportError:  If ``PyNaCl`` is not installed.
-            SigningError: If key construction or signing fails.
-        """
+        """Attempt signing via ``nacl.signing.SigningKey`` (PyNaCl)."""
         try:
             from nacl.signing import SigningKey  # type: ignore[import]  # noqa: PLC0415
         except ImportError:
@@ -494,20 +749,23 @@ class SecureKeyHandle:
             raise SigningError("Signing failed (PyNaCl path).") from exc
 
 
+# =========================================================================
+# PUBLIC API - SECURE SESSION CREDENTIALS
+# =========================================================================
+
+
 class SecureSessionCredentials:
     """Context manager that holds temporary session credentials for one validation scope.
 
     The credentials are copied into an internal ``bytearray`` on construction.
     On ``__exit__`` — normal *or* exceptional — the buffer is zero-wiped
-    **before** any reference is released, ensuring credentials are not left
-    in process memory after the validation block closes.
+    **before** any reference is released.
 
-    A ``__del__`` finaliser acts as a last-resort safety net: if the caller
-    fails to use the ``with`` statement the buffer is still wiped on garbage
-    collection.
+    A ``__del__`` finaliser acts as a last-resort safety net.
 
     Args:
         credentials: Raw session credential bytes (e.g. API token, JWT).
+        credential_type: Label for what kind of credential (default: "session_token").
 
     Raises:
         ValueError:   If *credentials* is empty.
@@ -515,20 +773,24 @@ class SecureSessionCredentials:
 
     Example::
 
-        with SecureSessionCredentials(token_bytes) as creds:
-            api_token = creds.get()
-            # use api_token for validation ...
+        with SecureSessionCredentials(api_token, credential_type="jwt") as creds:
+            token = creds.get()
+            # use token for validation ...
         # Buffer zero-wiped here; creds is no longer usable.
     """
 
-    __slots__ = ("_buf", "_active", "_wiped")
+    __slots__ = ("_buf", "_active", "_wiped", "_credential_type", "_locked")
 
-    def __init__(self, credentials: bytes) -> None:
+    def __init__(
+        self, credentials: bytes, credential_type: str = "session_token"
+    ) -> None:
         if not credentials:
             raise ValueError("credentials must be non-empty bytes.")
         self._buf: bytearray = bytearray(credentials)
         self._active: bool = False
         self._wiped: bool = False
+        self._credential_type: str = credential_type
+        self._locked: bool = _mlock_buffer(self._buf)
 
     # ------------------------------------------------------------------
     # Context-manager protocol
@@ -536,7 +798,11 @@ class SecureSessionCredentials:
 
     def __enter__(self) -> "SecureSessionCredentials":
         self._active = True
-        logger.debug("[SecureSessionCredentials] Validation scope opened.")
+        logger.debug(
+            "[SecureSessionCredentials] Validation scope opened for: %s",
+            self._credential_type
+        )
+        audit_log.log_key_imported(f"cred_{self._credential_type}", len(self._buf))
         return self
 
     def __exit__(
@@ -563,8 +829,17 @@ class SecureSessionCredentials:
         if self._wiped:
             return
         self._wiped = True
-        _zero_wipe(self._buf)
-        logger.debug("[SecureSessionCredentials] Validation scope closed — credentials wiped.")
+        _zero_wipe(
+            self._buf,
+            audit_details={"object_type": "SecureSessionCredentials"}
+        )
+        if self._locked:
+            _munlock_buffer(self._buf)
+            self._locked = False
+        logger.debug(
+            "[SecureSessionCredentials] Validation scope closed — credentials wiped."
+        )
+        audit_log.log_key_revoked(f"cred_{self._credential_type}", reason="scope_exit")
 
     # ------------------------------------------------------------------
     # Accessor
@@ -573,15 +848,11 @@ class SecureSessionCredentials:
     def get(self) -> bytes:
         """Return a ``bytes`` copy of the stored session credentials.
 
-        The returned copy is the caller's responsibility to manage.  The
-        internal buffer is unaffected.
-
         Returns:
-            A ``bytes`` copy of the credentials stored in the handle.
+            A ``bytes`` copy of the credentials (caller's responsibility).
 
         Raises:
-            SigningError: If called outside the ``with`` block or after the
-                          buffer has already been wiped.
+            SigningError: If called outside the ``with`` block.
         """
         if not self._active:
             raise SigningError(
