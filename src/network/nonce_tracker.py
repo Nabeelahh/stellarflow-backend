@@ -115,6 +115,161 @@ class PredictiveRPCSupervisor:
 
         logger.error("CRITICAL FAILURE: Comprehensive Horizon node matrix completely unreachable. No healthy nodes found.")
 
-    def get_active_endpoint_url(self) -> str:
-        """Returns the currently active, validated node URL for ledger submissions."""
-        return self.active_node.url
+
+class RPCNodeFailoverSupervisor:
+    """Proactive RPC node failover supervisor that monitors node connectivity.
+
+    It maintains a list of endpoints and runs a background thread to check their
+    latency and health using lightweight JSON-RPC requests. If the active node
+    experiences a latency drop or fails, the supervisor instantly shifts the
+    active traffic to the fastest available secondary node.
+
+    Complexity:
+    Time: O(1) for active endpoint lookup, O(N) for checking N endpoints.
+    Space: O(N) to store latency stats for N endpoints.
+    """
+
+    def __init__(
+        self,
+        endpoints: Optional[List[str]] = None,
+        check_interval_sec: float = 2.0,
+        latency_threshold_ms: float = 500.0,
+        ping_timeout_sec: float = 1.0,
+    ) -> None:
+        self.check_interval_sec = check_interval_sec
+        self.latency_threshold_ms = latency_threshold_ms
+        self.ping_timeout_sec = ping_timeout_sec
+
+        if endpoints is None:
+            primary = os.environ.get("RPC_URL")
+            fallbacks = os.environ.get("FALLBACK_RPC_URLS")
+            loaded = []
+            if primary:
+                loaded.append(primary.strip())
+            if fallbacks:
+                for f in fallbacks.split(","):
+                    if f.strip():
+                        loaded.append(f.strip())
+            if not loaded:
+                loaded = [
+                    "https://rpc.testnet.stellar.org",
+                    "https://rpc.mainnet.stellar.org",
+                ]
+            self.endpoints = loaded
+        else:
+            self.endpoints = list(endpoints)
+
+        self._lock = threading.Lock()
+        self._active_endpoint = self.endpoints[0] if self.endpoints else ""
+        self._latencies: Dict[str, float] = {ep: 0.0 for ep in self.endpoints}
+        self._healthy_endpoints: set = set(self.endpoints)
+
+        self._stop_event = threading.Event()
+        self._monitor_thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        """Start the background monitoring thread."""
+        with self._lock:
+            if self._monitor_thread is not None and self._monitor_thread.is_alive():
+                return
+            self._stop_event.clear()
+            self._monitor_thread = threading.Thread(
+                target=self._run_monitor,
+                name="RPCNodeFailoverSupervisor-Monitor",
+                daemon=True,
+            )
+            self._monitor_thread.start()
+            logger.info("[RPCNodeFailoverSupervisor] Started proactive background monitoring.")
+
+    def stop(self) -> None:
+        """Stop the background monitoring thread."""
+        self._stop_event.set()
+        if self._monitor_thread is not None:
+            self._monitor_thread.join(timeout=1.0)
+            self._monitor_thread = None
+            logger.info("[RPCNodeFailoverSupervisor] Stopped background monitoring.")
+
+    def get_active_endpoint(self) -> str:
+        """Return the currently selected active RPC endpoint."""
+        with self._lock:
+            return self._active_endpoint
+
+    def _ping_node(self, endpoint: str) -> Optional[float]:
+        """Perform a fast, lightweight check on a single node and return its latency in ms."""
+        try:
+            start = time.time()
+            response = requests.post(
+                endpoint,
+                json={"jsonrpc": "2.0", "id": 1, "method": "getHealth"},
+                timeout=self.ping_timeout_sec,
+            )
+            latency_ms = (time.time() - start) * 1000.0
+            if response.status_code == 200:
+                data = response.json()
+                if "result" in data or "error" in data:
+                    return latency_ms
+            return None
+        except Exception:
+            return None
+
+    def _run_monitor(self) -> None:
+        """Main loop for the background monitoring thread."""
+        while not self._stop_event.is_set():
+            temp_latencies = {}
+            temp_healthy = set()
+
+            for ep in self.endpoints:
+                latency = self._ping_node(ep)
+                if latency is not None:
+                    temp_latencies[ep] = latency
+                    temp_healthy.add(ep)
+                else:
+                    temp_latencies[ep] = float("inf")
+
+            with self._lock:
+                self._latencies.update(temp_latencies)
+                self._healthy_endpoints = temp_healthy
+
+                active_ok = False
+                active_latency = self._latencies.get(self._active_endpoint, float("inf"))
+
+                if (
+                    self._active_endpoint in self._healthy_endpoints
+                    and active_latency <= self.latency_threshold_ms
+                ):
+                    active_ok = True
+
+                if not active_ok:
+                    best_endpoint = self._active_endpoint
+                    best_latency = active_latency
+
+                    for ep in self.endpoints:
+                        ep_latency = self._latencies.get(ep, float("inf"))
+                        if ep in self._healthy_endpoints and ep_latency < best_latency:
+                            best_endpoint = ep
+                            best_latency = ep_latency
+
+                    if best_endpoint != self._active_endpoint:
+                        logger.warning(
+                            "[RPCNodeFailoverSupervisor] Shifted traffic from %s (latency: %.1fms) to %s (latency: %.1fms)",
+                            self._active_endpoint,
+                            active_latency,
+                            best_endpoint,
+                            best_latency,
+                        )
+                        self._active_endpoint = best_endpoint
+
+            self._stop_event.wait(self.check_interval_sec)
+
+
+rpc_supervisor = RPCNodeFailoverSupervisor()
+
+
+__all__ = [
+    "NonceTracker",
+    "NonceWindow",
+    "nonce_tracker",
+    "nonce_window",
+    "RPCNodeFailoverSupervisor",
+    "rpc_supervisor",
+]
