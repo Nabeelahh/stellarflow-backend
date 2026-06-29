@@ -302,7 +302,7 @@ class SecureKeyHandle:
         # Buffer zero-wiped here; handle is inert.
     """
 
-    __slots__ = ("_buf", "_active", "_wiped", "_locked")
+    __slots__ = ("__dict__", "_buf", "_active", "_wiped", "_locked")
 
     def __init__(self, raw_key: bytes) -> None:
         if not raw_key:
